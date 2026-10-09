@@ -65,6 +65,54 @@ object Store {
         return Setup(id, o.getLong("v"), o.getInt("u"), pts)
     }
 
+    // ---- chhoti settings (apne aap yaad rehti hain)
+    fun isPanelOff(c: Context): Boolean = prefs(c).getBoolean("panel_off", false)
+
+    fun setPanelOff(c: Context, off: Boolean) {
+        prefs(c).edit().putBoolean("panel_off", off).apply()
+    }
+
+    fun saveInterval(c: Context, value: Long, unit: Int) {
+        prefs(c).edit().putLong("iv", value).putInt("iu", unit).apply()
+    }
+
+    fun loadInterval(c: Context): Pair<Long, Int> {
+        val p = prefs(c)
+        return Pair(p.getLong("iv", 1L), p.getInt("iu", 1))
+    }
+
+    // ---- abhi ka kaam apne aap save (band/chalu karne par wapas aa jata hai)
+    fun saveSession(c: Context, points: List<List<Float>>) {
+        val arr = JSONArray()
+        for (p in points) {
+            val one = JSONArray()
+            for (f in p) one.put(f.toDouble())
+            arr.put(one)
+        }
+        prefs(c).edit().putString("session", arr.toString()).apply()
+    }
+
+    fun loadSession(c: Context): List<List<Float>> {
+        val out = ArrayList<List<Float>>()
+        try {
+            val arr = JSONArray(prefs(c).getString("session", "[]") ?: "[]")
+            for (i in 0 until arr.length()) {
+                val a = arr.getJSONArray(i)
+                val one = ArrayList<Float>()
+                for (j in 0 until a.length()) one.add(a.getDouble(j).toFloat())
+                out.add(one)
+            }
+        } catch (e: Exception) {
+        }
+        return out
+    }
+
+    fun delete(c: Context, id: String) {
+        val all = readAll(c)
+        all.remove(id)
+        prefs(c).edit().putString("setups", all.toString()).apply()
+    }
+
     fun list(c: Context): List<Setup> {
         val all = readAll(c)
         val out = ArrayList<Setup>()
