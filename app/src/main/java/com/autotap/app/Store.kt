@@ -16,6 +16,8 @@ data class Setup(
 )
 
 object Store {
+    const val REMOVABLE = 8
+
     private fun prefs(c: Context) =
         c.getSharedPreferences("autotap", Context.MODE_PRIVATE)
 
@@ -105,6 +107,13 @@ object Store {
         } catch (e: Exception) {
         }
         return out
+    }
+
+    // floating ke kitne button chhupe hue hain (permanent yaad rehta hai)
+    fun hiddenCount(c: Context): Int = prefs(c).getInt("hidden", 0)
+
+    fun setHiddenCount(c: Context, n: Int) {
+        prefs(c).edit().putInt("hidden", n).apply()
     }
 
     fun delete(c: Context, id: String) {
