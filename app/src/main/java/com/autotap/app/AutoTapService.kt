@@ -2,12 +2,8 @@ package com.autotap.app
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.content.BroadcastReceiver
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -15,7 +11,6 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -62,12 +57,13 @@ class AutoTapService : AccessibilityService() {
     private var recordView: View? = null
 
     private val actions = ArrayList<Action>()
+    private val removable = ArrayList<View>()
+    private val typedId = StringBuilder()
 
     private var running = false
     private var recording = false
     private var hidden = false
     private var stealth = false
-    private var receiverOn = false
     private var idx = 0
     private var value = 1L
     private var unit = 1 // 0 ms, 1 sec, 2 min
@@ -78,31 +74,13 @@ class AutoTapService : AccessibilityService() {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 
-    // phone unlock hote hi chhupa hua panel wapas aa jayega
-    private val unlockReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (hidden && !stealth) restore()
-        }
-    }
-
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        try {
-            val f = IntentFilter(Intent.ACTION_USER_PRESENT)
-            if (Build.VERSION.SDK_INT >= 33) {
-                registerReceiver(unlockReceiver, f, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                registerReceiver(unlockReceiver, f)
-            }
-            receiverOn = true
-        } catch (e: Exception) {
-        }
         val iv = Store.loadInterval(this)
         value = iv.first
         unit = iv.second
-        if (!Store.isPanelOff(this)) showPanel()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -111,13 +89,6 @@ class AutoTapService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         cleanupAll()
-        if (receiverOn) {
-            try {
-                unregisterReceiver(unlockReceiver)
-            } catch (e: Exception) {
-            }
-            receiverOn = false
-        }
         instance = null
         return super.onUnbind(intent)
     }
@@ -294,15 +265,19 @@ class AutoTapService : AccessibilityService() {
         val add = btn("+", 0xFF1976D2.toInt())
         val swipe = btn("↕", 0xFF6A1B9A.toInt())
         val eye = btn("👁", 0xFF00796B.toInt())
+        val save = btn("💾", 0xFF0277BD.toInt())
+        val minus = btn("−", 0xFF455A64.toInt())
         val set = btn("⚙", 0xFFF57C00.toInt())
         val close = btn("✕", 0xFFC62828.toInt())
 
         col.addView(handle)
+        col.addView(minus)
         col.addView(play)
         col.addView(rec)
         col.addView(add)
         col.addView(swipe)
         col.addView(eye)
+        col.addView(save)
         col.addView(set)
         col.addView(close)
 
@@ -353,13 +328,41 @@ class AutoTapService : AccessibilityService() {
                 hideAll(true)
             }
         }
+        save.setOnClickListener { toggleIdBox() }
         set.setOnClickListener { toggleSettings() }
+        minus.setOnClickListener {
+            val n = Store.hiddenCount(this)
+            if (n >= Store.REMOVABLE) {
+                toast("Aur button nahi bache. Sab wapas lane ke liye − ko lamba dabao.")
+            } else {
+                Store.setHiddenCount(this, n + 1)
+                applyHidden()
+            }
+        }
+        minus.setOnLongClickListener {
+            Store.setHiddenCount(this, 0)
+            applyHidden()
+            toast("Saare button wapas aa gaye")
+            true
+        }
         close.setOnClickListener { showCloseChoice() }
 
         wm.addView(col, p)
         panel = col
         panelLp = p
-        restoreSession()
+        removable.clear()
+        removable.addAll(listOf(close, eye, set, save, swipe, add, rec, play))
+        applyHidden()
+    }
+
+    fun isPanelShown(): Boolean = panel != null
+
+    // minus se jitne button chhupe hain utne gayab (chhupne ka order: band, 👁, ⚙, 💾, ↕, +, ●, ▶)
+    fun applyHidden() {
+        val n = Store.hiddenCount(this)
+        for (i in removable.indices) {
+            removable[i].visibility = if (i < n) View.GONE else View.VISIBLE
+        }
     }
 
     private fun bringPanelToFront() {
@@ -444,7 +447,7 @@ class AutoTapService : AccessibilityService() {
         if (quiet) {
             toast("Chhupa kar chal raha hai. Wapas lane ke liye chhota bindu dabao.")
         } else {
-            toast("Chhup gaya. Unlock karne par ya 'A' dabane par wapas aayega.")
+            toast("Chhup gaya. Wapas lane ke liye logo icon dabao.")
         }
     }
 
@@ -467,7 +470,7 @@ class AutoTapService : AccessibilityService() {
     private fun panelOffForever() {
         Store.setPanelOff(this, true)
         cleanupAll()
-        toast("Panel band. Wapas lane ke liye AutoTap app kholo aur 'Floating panel dikhao' dabao.")
+        toast("Panel band. Wapas lane ke liye AutoTap app me START dabao.")
     }
 
     private fun openAccessibilitySettings() {
@@ -488,12 +491,12 @@ class AutoTapService : AccessibilityService() {
 
         box.addView(title("Floating window band karni hai?"))
 
-        val hide = action("Abhi chhupao\n(unlock karne par ya 'A' dabane par wapas aa jayega)", 0xFF1976D2.toInt())
+        val hide = action("Abhi chhupao\n(logo icon dabane par wapas aayega)", 0xFF1976D2.toInt())
         hide.setOnClickListener {
             closeSettings()
             hideAll(false)
         }
-        val off = action("Panel permanent band\n(apne aap nahi khulega. Pehle Save kar lena)", 0xFFF57C00.toInt())
+        val off = action("Panel band karo\n(START dabane par hi wapas aayega)", 0xFFF57C00.toInt())
         off.setOnClickListener {
             closeSettings()
             panelOffForever()
@@ -537,7 +540,7 @@ class AutoTapService : AccessibilityService() {
         val p = lp(dp(44), dp(44))
         p.x = cx - dp(22)
         p.y = cy - dp(22)
-        makeDraggable(t, t, p, onMove = { lineView?.invalidate() }, onDrop = { autoSave() })
+        makeDraggable(t, t, p, onMove = { lineView?.invalidate() })
         if (recording) {
             p.flags = p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
             t.alpha = 0.5f
@@ -550,7 +553,6 @@ class AutoTapService : AccessibilityService() {
         val n = actions.size + 1
         val m = newMarker(n.toString(), 0xAAE53935.toInt(), cx, cy)
         actions.add(Action(m.first, m.second, null, null))
-        autoSave()
     }
 
     private fun addSwipe(x1: Int, y1: Int, x2: Int, y2: Int) {
@@ -560,7 +562,6 @@ class AutoTapService : AccessibilityService() {
         val b = newMarker("E$n", 0xAA1565C0.toInt(), x2, y2)
         actions.add(Action(a.first, a.second, b.first, b.second))
         lineView?.invalidate()
-        autoSave()
     }
 
     // ---------------------------------------------------------------- autosave
@@ -586,10 +587,6 @@ class AutoTapService : AccessibilityService() {
         return pts
     }
 
-    private fun autoSave() {
-        Store.saveSession(this, currentPoints())
-    }
-
     private fun addFromPoints(points: List<List<Float>>) {
         val dm = resources.displayMetrics
         for (pt in points) {
@@ -605,11 +602,6 @@ class AutoTapService : AccessibilityService() {
                 )
             }
         }
-    }
-
-    private fun restoreSession() {
-        if (actions.isNotEmpty()) return
-        addFromPoints(Store.loadSession(this))
     }
 
     private fun removeMarkers() {
@@ -913,8 +905,176 @@ class AutoTapService : AccessibilityService() {
         Store.saveInterval(this, value, unit)
         removeMarkers()
         addFromPoints(s.points)
-        autoSave()
         toast("Load ho gaya: ${s.points.size} action")
+    }
+
+    // ---------------------------------------------------------------- ID box (save + ID daalna, ek hi jagah)
+
+    private fun keyBtn(text: String, onClick: () -> Unit): TextView {
+        val t = smallBtn(text, 0xFF607D8B.toInt(), onClick)
+        t.setPadding(0, dp(8), 0, dp(8))
+        t.textSize = 15f
+        return t
+    }
+
+    private fun toggleIdBox() {
+        if (settingsView != null) {
+            closeSettings()
+            return
+        }
+        if (running || recording) {
+            toast("Pehle stop karo")
+            return
+        }
+        openIdBox(null, true)
+    }
+
+    private fun openIdBox(msg: String?, ok: Boolean) {
+        typedId.setLength(0)
+
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(16), dp(14), dp(16), dp(16))
+        box.addView(title("ID: save aur load"))
+
+        if (msg != null) {
+            val m = TextView(this)
+            m.text = msg
+            m.textSize = 18f
+            m.typeface = Typeface.DEFAULT_BOLD
+            m.setTextColor(if (ok) 0xFF2E7D32.toInt() else 0xFFC62828.toInt())
+            m.setPadding(0, dp(4), 0, dp(4))
+            box.addView(m)
+        }
+
+        // ---- save
+        val save = action("Save karo (naya ID banao)", 0xFF2E7D32.toInt())
+        save.setOnClickListener {
+            if (actions.isEmpty()) {
+                handler.post {
+                    closeSettings()
+                    openIdBox("Pehle koi tap ya swipe lagao, tabhi save hoga.", false)
+                }
+            } else {
+                val id = Store.save(this, value, unit, currentPoints())
+                handler.post {
+                    closeSettings()
+                    openIdBox("Save ho gaya. ID: " + id, true)
+                }
+            }
+        }
+        box.addView(save)
+
+        // ---- ID daalo (screen ka apna keypad, keyboard nahi chahiye)
+        box.addView(label("ID daalo (load karne ke liye)"))
+        val disp = TextView(this)
+        disp.textSize = 22f
+        disp.typeface = Typeface.DEFAULT_BOLD
+        disp.setTextColor(0xFF1565C0.toInt())
+        disp.gravity = Gravity.CENTER
+        disp.setPadding(0, dp(4), 0, dp(4))
+        fun refreshDisp() {
+            if (typedId.isEmpty()) {
+                disp.text = "- - - - - -"
+            } else {
+                disp.text = typedId.toString().toCharArray().joinToString(" ")
+            }
+        }
+        refreshDisp()
+        box.addView(disp)
+
+        val chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        for (r in 0 until 4) {
+            val kr = row()
+            for (k in 0 until 8) {
+                val ch = chars[r * 8 + k].toString()
+                kr.addView(keyBtn(ch) {
+                    if (typedId.length < 6) {
+                        typedId.append(ch)
+                        refreshDisp()
+                    }
+                })
+            }
+            box.addView(kr)
+        }
+
+        val ctl = row()
+        ctl.addView(smallBtn("⌫ mitao", 0xFF455A64.toInt()) {
+            if (typedId.isNotEmpty()) {
+                typedId.setLength(typedId.length - 1)
+                refreshDisp()
+            }
+        })
+        ctl.addView(smallBtn("Load karo", 0xFF1976D2.toInt()) {
+            val s = Store.load(this, typedId.toString())
+            if (s == null) {
+                handler.post {
+                    closeSettings()
+                    openIdBox("Ye ID nahi mili.", false)
+                }
+            } else {
+                handler.post {
+                    loadSetup(s)
+                    closeSettings()
+                }
+            }
+        })
+        box.addView(ctl)
+
+        // ---- saved list (tap karke load)
+        box.addView(label("Saved IDs (tap karke load karo)"))
+        val list = Store.list(this)
+        if (list.isEmpty()) {
+            val e = TextView(this)
+            e.text = "Abhi koi save nahi hai."
+            e.setTextColor(0xFF607D8B.toInt())
+            box.addView(e)
+        } else {
+            for (s in list) {
+                val r = row()
+                r.gravity = Gravity.CENTER_VERTICAL
+
+                val info = TextView(this)
+                info.text = s.id + "   " + s.points.size + " action, har " + s.value + " " + unitName(s.unit)
+                info.setTextColor(0xFF263238.toInt())
+                info.textSize = 14f
+                info.setPadding(dp(10), dp(10), dp(10), dp(10))
+                info.background = rounded(0xFFE3F2FD.toInt(), 8)
+                val il = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                il.setMargins(0, dp(4), dp(6), dp(4))
+                info.layoutParams = il
+                info.setOnClickListener {
+                    handler.post {
+                        loadSetup(s)
+                        closeSettings()
+                    }
+                }
+
+                val del = TextView(this)
+                del.text = "Hatao"
+                del.textSize = 13f
+                del.setTextColor(Color.WHITE)
+                del.setPadding(dp(10), dp(10), dp(10), dp(10))
+                del.background = rounded(0xFFC62828.toInt(), 8)
+                del.setOnClickListener {
+                    Store.delete(this, s.id)
+                    handler.post {
+                        closeSettings()
+                        openIdBox("ID " + s.id + " hata di.", true)
+                    }
+                }
+
+                r.addView(info)
+                r.addView(del)
+                box.addView(r)
+            }
+        }
+
+        val done = action("Band karo", 0xFF616161.toInt())
+        done.setOnClickListener { closeSettings() }
+        box.addView(done)
+
+        showBox(box, 40)
     }
 
     private fun toggleSettings() {
@@ -934,7 +1094,7 @@ class AutoTapService : AccessibilityService() {
         box.orientation = LinearLayout.VERTICAL
         box.setPadding(dp(16), dp(14), dp(16), dp(16))
 
-        box.addView(title("AutoTap settings"))
+        box.addView(title("Time settings"))
         box.addView(label("Har action (tap/swipe) ke beech ka time"))
 
         // ---- abhi ka time (badi likhawat me)
@@ -1010,94 +1170,9 @@ class AutoTapService : AccessibilityService() {
             box.addView(pr)
         }
 
-        // ---- message (save hua ya galti)
-        if (msg != null) {
-            val m = TextView(this)
-            m.text = msg
-            m.textSize = 16f
-            m.typeface = Typeface.DEFAULT_BOLD
-            m.setTextColor(if (ok) 0xFF2E7D32.toInt() else 0xFFC62828.toInt())
-            m.setPadding(0, dp(10), 0, dp(2))
-            box.addView(m)
-        }
-
-        // ---- save
-        val save = action("Save karo (ID banao)", 0xFF2E7D32.toInt())
-        save.setOnClickListener {
-            if (actions.isEmpty()) {
-                handler.post {
-                    closeSettings()
-                    openSettings("Pehle koi tap ya swipe lagao, tabhi save hoga.", false)
-                }
-            } else {
-                val pts = currentPoints()
-                val id = Store.save(this, value, unit, pts)
-                try {
-                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("AutoTap ID", id))
-                } catch (e: Exception) {
-                }
-                handler.post {
-                    closeSettings()
-                    openSettings("Save ho gaya. ID: $id (copy ho gayi)", true)
-                }
-            }
-        }
-        box.addView(save)
-
-        // ---- saved list (tap karke load)
-        box.addView(label("Saved setups (naam par tap karke load karo)"))
-        val list = Store.list(this)
-        if (list.isEmpty()) {
-            val e = TextView(this)
-            e.text = "Abhi koi save nahi hai."
-            e.setTextColor(0xFF607D8B.toInt())
-            box.addView(e)
-        } else {
-            for (s in list) {
-                val r = row()
-                r.gravity = Gravity.CENTER_VERTICAL
-
-                val info = TextView(this)
-                info.text = s.id + "   " + s.points.size + " action, har " + s.value + " " + unitName(s.unit)
-                info.setTextColor(0xFF263238.toInt())
-                info.textSize = 14f
-                info.setPadding(dp(10), dp(10), dp(10), dp(10))
-                info.background = rounded(0xFFE3F2FD.toInt(), 8)
-                val il = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                il.setMargins(0, dp(4), dp(6), dp(4))
-                info.layoutParams = il
-                info.setOnClickListener {
-                    handler.post {
-                        loadSetup(s)
-                        closeSettings()
-                    }
-                }
-
-                val del = TextView(this)
-                del.text = "Hatao"
-                del.textSize = 13f
-                del.setTextColor(Color.WHITE)
-                del.setPadding(dp(10), dp(10), dp(10), dp(10))
-                del.background = rounded(0xFFC62828.toInt(), 8)
-                del.setOnClickListener {
-                    Store.delete(this, s.id)
-                    handler.post {
-                        closeSettings()
-                        openSettings("ID " + s.id + " hata di.", true)
-                    }
-                }
-
-                r.addView(info)
-                r.addView(del)
-                box.addView(r)
-            }
-        }
-
         val clear = action("Saare points/lines hatao", 0xFFF57C00.toInt())
         clear.setOnClickListener {
             removeMarkers()
-            autoSave()
             toast("Sab hat gaya")
         }
         box.addView(clear)
