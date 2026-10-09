@@ -20,6 +20,7 @@ class MainActivity : Activity() {
 
     private lateinit var status: TextView
     private lateinit var savedBox: LinearLayout
+    private lateinit var hiddenInfo: TextView
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -69,6 +70,29 @@ class MainActivity : Activity() {
         t.typeface = Typeface.DEFAULT_BOLD
         t.setTextColor(0xFF1A237E.toInt())
         return t
+    }
+
+    private fun half(text: String, color: Int, onClick: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = text
+        t.setTextColor(Color.WHITE)
+        t.textSize = 14f
+        t.typeface = Typeface.DEFAULT_BOLD
+        t.gravity = Gravity.CENTER
+        t.setPadding(dp(4), dp(12), dp(4), dp(12))
+        t.background = rounded(color, 10)
+        val l = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        l.setMargins(dp(3), dp(10), dp(3), 0)
+        t.layoutParams = l
+        t.setOnClickListener { onClick() }
+        return t
+    }
+
+    private fun changeHidden(d: Int) {
+        val n = maxOf(0, minOf(Store.REMOVABLE, Store.hiddenCount(this) + d))
+        Store.setHiddenCount(this, n)
+        AutoTapService.instance?.applyHidden()
+        refresh()
     }
 
     private fun openAccessibility() {
@@ -164,6 +188,22 @@ class MainActivity : Activity() {
             )
         })
 
+        // ---- floating ke buttons kam / zyada
+        val bcard = card()
+        bcard.addView(heading("Floating ke buttons"))
+        hiddenInfo = TextView(this)
+        hiddenInfo.setPadding(0, dp(6), 0, 0)
+        hiddenInfo.textSize = 14f
+        hiddenInfo.setTextColor(0xFF263238.toInt())
+        bcard.addView(hiddenInfo)
+        val brow = LinearLayout(this)
+        brow.orientation = LinearLayout.HORIZONTAL
+        brow.addView(half("−  ek kam", 0xFFF57C00.toInt()) { changeHidden(1) })
+        brow.addView(half("+  ek wapas", 0xFF2E7D32.toInt()) { changeHidden(-1) })
+        brow.addView(half("Sab wapas", 0xFF1976D2.toInt()) { changeHidden(-100) })
+        bcard.addView(brow)
+        root.addView(bcard)
+
         // ---- legend
         val legend = card()
         legend.addView(heading("Floating panel ke buttons"))
@@ -177,9 +217,11 @@ class MainActivity : Activity() {
             "+   ek tap point lagao\n" +
             "↕   swipe line lagao (S se E tak, kisi bhi disha me)\n" +
             "👁   sab chhupa do, kaam chalta rahe (chhota bindu dabao to wapas)\n" +
-            "⚙   time (+/- aur jaldi wale buttons), save (ID), saved list se load\n" +
+            "−   ek button chhupao (baar-baar dabao), lamba dabao to sab wapas\n" +
+            "💾   ID: save karo ya ID daalkar load karo\n" +
+            "⚙   sirf time set (+/- aur jaldi wale buttons)\n" +
             "✕   band: chhupao / panel permanent band / poora band\n\n" +
-            "Aapka kaam apne aap yaad rehta hai. Naam se alag save karne ke liye ⚙ me Save dabao."
+            "Kuch bhi apne aap nahi hota. Sab aapke button dabane se hota hai."
         legend.addView(lt)
         root.addView(legend)
 
@@ -199,18 +241,18 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        // chhupa hua panel wapas lao
-        AutoTapService.instance?.restore()
         refresh()
     }
 
     private fun refresh() {
+        hiddenInfo.text = "Chhupe hue button: " + Store.hiddenCount(this) + " / " + Store.REMOVABLE +
+            "\nFloating me − dabate jao to ek-ek karke button chhupte hain."
         if (AutoTapService.instance == null) {
             status.text = "●  Band hai. Accessibility me AutoTap ON karo, phir START dabao."
             status.setTextColor(0xFFB71C1C.toInt())
             status.background = rounded(0xFFFFCDD2.toInt(), 12)
-        } else if (Store.isPanelOff(this)) {
-            status.text = "●  Floating band hai. START dabao to aa jayega."
+        } else if (AutoTapService.instance?.isPanelShown() != true) {
+            status.text = "●  Accessibility chalu hai, floating abhi band hai. START dabao."
             status.setTextColor(0xFFE65100.toInt())
             status.background = rounded(0xFFFFE0B2.toInt(), 12)
         } else {
