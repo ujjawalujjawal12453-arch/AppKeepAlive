@@ -2,8 +2,11 @@ package com.autotap.app
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -11,10 +14,14 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
+import android.util.Base64
 import android.text.InputType
+import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -28,6 +35,12 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.Executor
+import org.json.JSONArray
+import org.json.JSONObject
 
 // Ek action: tap (sirf m1) ya swipe (m1 se m2 tak line)
 private class Action(
@@ -35,13 +48,24 @@ private class Action(
     val p1: WindowManager.LayoutParams,
     val m2: TextView?,
     val p2: WindowManager.LayoutParams?
-)
+) {
+    var dv = 0L // is point se pehle kitna ruke (0 = default time)
+    var du = 1  // dv ki unit: 0 ms, 1 second, 2 minute
+    var rp = 1  // kitni baar
+}
 
 class AutoTapService : AccessibilityService() {
 
     companion object {
         var instance: AutoTapService? = null
         const val SWIPE_MS = 400L
+        const val AI_PROMPT = """This is a screenshot of an Android phone. An auto-tapper app is running a loop of taps on this screen.
+If a popup, dialog, permission prompt, ad or similar overlay is blocking the screen, pick ONE button that dismisses it or lets things continue (for example OK, Allow, Continue, Close, X, Skip, Not now, Got it, or Cancel when it just closes the dialog).
+NEVER pick buttons about payments, purchases, subscriptions, deleting, uninstalling, sending money, sending messages, or confirming orders.
+If nothing is blocking the screen, or the only choices look risky, answer none.
+Reply with ONLY JSON, no other text:
+{"action":"tap","label":"button text","box_2d":[ymin,xmin,ymax,xmax]} with coordinates normalized to 0-1000
+or {"action":"none"}"""
     }
 
     private lateinit var wm: WindowManager
@@ -59,6 +83,17 @@ class AutoTapService : AccessibilityService() {
 
     private val actions = ArrayList<Action>()
     private val typedId = StringBuilder()
+    private var currentId: String? = null
+    private var rep = 0
+    private var paused = false
+    private var aiBusy = false
+    private var aiLastMs = 0L
+    private var aiCalls = 0
+    private var aiFails = 0
+    private var aiAttempt = 0
+    private var aiModelRetried = false
+    private var basePkg: String? = null
+    private var lastPkg: String? = null
 
     private var running = false
     private var recording = false
@@ -83,7 +118,222 @@ class AutoTapService : AccessibilityService() {
         unit = iv.second
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    // ---------------------------------------------------------------- AI madad (Google Gemini)
+
+    // Chalte waqt koi popup / dialog aaye to (aur AI ON ho to) screen ki tasveer Gemini ko bhejkar
+    // pooochta hai ki kaun sa button dabana hai. Sirf tab jab AI ON ho aur loop chal raha ho.
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null || event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val pkg = event.packageName?.toString() ?: return
+        if (pkg == packageName) return
+        val cls = event.className?.toString() ?: ""
+        lastPkg = pkg
+        if (!running || !Store.isAiOn(this)) return
+        if (pkg == "com.android.systemui") return
+        val base = basePkg
+        val looksDialog = cls.contains("Dialog", true) || cls.contains("Alert", true) ||
+            cls.contains("Popup", true)
+        val otherApp = base != null && pkg != base
+        if (looksDialog || otherApp) askAi()
+    }
+
+    private fun askAi() {
+        if (aiBusy || aiCalls >= 40 || aiFails >= 3) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - aiLastMs < 3000L) return
+        if (Build.VERSION.SDK_INT < 30) {
+            aiFails = 99
+            toast("AI ke liye Android 11 ya naya chahiye")
+            return
+        }
+        val key = Store.aiKey(this)
+        if (key.isBlank()) {
+            aiFails = 99
+            toast("AI key nahi hai. AutoTap app me daalo.")
+            return
+        }
+        aiBusy = true
+        paused = true
+        aiAttempt = 0
+        aiModelRetried = false
+        aiLastMs = now
+        aiCalls++
+        toast("AI screen dekh raha hai...")
+        handler.postDelayed({ takeShot(key) }, 700)
+    }
+
+    private fun aiDone(msg: String?, failed: Boolean = false) {
+        aiBusy = false
+        if (failed) aiFails++
+        if (msg != null) toast(msg)
+        handler.postDelayed({ paused = false }, 600)
+    }
+
+    private fun takeShot(key: String) {
+        if (!running) {
+            aiBusy = false
+            paused = false
+            return
+        }
+        try {
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                Executor { r -> handler.post(r) },
+                object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
+                        try {
+                            val hb = screenshot.hardwareBuffer
+                            val hw = Bitmap.wrapHardwareBuffer(hb, screenshot.colorSpace)
+                            if (hw == null) {
+                                hb.close()
+                                aiDone("Screenshot nahi mil paya", true)
+                                return
+                            }
+                            val full = hw.copy(Bitmap.Config.ARGB_8888, false)
+                            hb.close()
+                            val fw = full.width
+                            val fh = full.height
+                            val sw = minOf(fw, 720)
+                            val sh = maxOf(1, fh * sw / fw)
+                            val small = Bitmap.createScaledBitmap(full, sw, sh, true)
+                            val bos = ByteArrayOutputStream()
+                            small.compress(Bitmap.CompressFormat.JPEG, 70, bos)
+                            val b64 = Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+                            callGemini(key, b64, fw, fh)
+                        } catch (e: Exception) {
+                            aiDone("Screenshot ka kaam nahi hua", true)
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        aiDone("Screenshot nahi mil paya (code " + errorCode + ")", true)
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            aiDone("Screenshot nahi mil paya", true)
+        }
+    }
+
+    private fun callGemini(key: String, b64: String, fw: Int, fh: Int) {
+        val parts = JSONArray()
+        parts.put(JSONObject().put("text", AI_PROMPT))
+        parts.put(
+            JSONObject().put(
+                "inline_data",
+                JSONObject().put("mime_type", "image/jpeg").put("data", b64)
+            )
+        )
+        val body = JSONObject()
+        body.put("contents", JSONArray().put(JSONObject().put("parts", parts)))
+        body.put(
+            "generationConfig",
+            JSONObject().put("responseMimeType", "application/json").put("temperature", 0)
+        )
+        val payload = body.toString().toByteArray(Charsets.UTF_8)
+
+        Thread {
+            try {
+                var model = Store.aiModel(this)
+                if (model.isBlank()) {
+                    // model abhi chuna nahi gaya: apne aap chuno aur yaad rakho
+                    val picked = Gemini.pickModel(key)
+                    model = picked ?: "gemini-flash-latest"
+                    if (picked != null) Store.setAiModel(this, picked)
+                }
+                val url = URL(
+                    "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
+                )
+                val c = url.openConnection() as HttpURLConnection
+                c.requestMethod = "POST"
+                c.connectTimeout = 15000
+                c.readTimeout = 45000
+                c.doOutput = true
+                c.setRequestProperty("Content-Type", "application/json")
+                c.setRequestProperty("x-goog-api-key", key)
+                c.outputStream.use { it.write(payload) }
+                val code = c.responseCode
+                val stream = if (code in 200..299) c.inputStream else c.errorStream
+                val txt = stream?.bufferedReader()?.readText() ?: ""
+                handler.post { onAiReply(code, txt, fw, fh) }
+            } catch (e: Exception) {
+                handler.post { aiDone("AI se baat nahi ho paayi (internet check karo)", true) }
+            }
+        }.start()
+    }
+
+    private fun onAiReply(code: Int, txt: String, fw: Int, fh: Int) {
+        if (!running) {
+            aiBusy = false
+            paused = false
+            return
+        }
+        if (code == 404 && !aiModelRetried) {
+            // model ka naam purana ho gaya ho to naya apne aap chuno aur dobara koshish karo
+            aiModelRetried = true
+            val key = Store.aiKey(this)
+            Thread {
+                val m = Gemini.pickModel(key)
+                handler.post {
+                    if (m != null) {
+                        Store.setAiModel(this, m)
+                        handler.postDelayed({ takeShot(key) }, 300)
+                    } else {
+                        aiDone("AI ka model nahi mila (internet ya key check karo)", true)
+                    }
+                }
+            }.start()
+            return
+        }
+        if (code !in 200..299) {
+            val hint = if (code == 400 || code == 401 || code == 403) {
+                "AI key galat ya band hai (code " + code + ")"
+            } else {
+                "AI ne error diya (code " + code + ")"
+            }
+            aiDone(hint, true)
+            return
+        }
+        try {
+            val root = JSONObject(txt)
+            var t = root.getJSONArray("candidates").getJSONObject(0)
+                .getJSONObject("content").getJSONArray("parts").getJSONObject(0)
+                .getString("text").trim()
+            if (t.startsWith("```")) {
+                t = t.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+            }
+            val o = if (t.startsWith("[")) JSONArray(t).getJSONObject(0) else JSONObject(t)
+            if (o.optString("action") == "tap") {
+                val b = o.getJSONArray("box_2d")
+                val ymin = b.getDouble(0)
+                val xmin = b.getDouble(1)
+                val ymax = b.getDouble(2)
+                val xmax = b.getDouble(3)
+                if (ymin < 0 || xmin < 0 || ymax > 1000 || xmax > 1000 || ymax <= ymin || xmax <= xmin) {
+                    aiDone("AI ka jawab galat tha", true)
+                    return
+                }
+                val x = ((xmin + xmax) / 2.0 / 1000.0 * fw).toInt()
+                val y = ((ymin + ymax) / 2.0 / 1000.0 * fh).toInt()
+                tap(x, y)
+                aiAttempt++
+                toast("AI ne dabaya: " + o.optString("label"))
+                if (aiAttempt < 3) {
+                    // popup hata ya nahi, thodi der baad dobara dekho. Hat gaya to AI band aur loop wapas chalu.
+                    val key = Store.aiKey(this)
+                    aiCalls++
+                    handler.postDelayed({ takeShot(key) }, 1300)
+                } else {
+                    aiDone(null)
+                }
+            } else {
+                // koi popup nahi (ya hat chuka): AI wapas so jata hai, loop chalu
+                aiDone(null)
+            }
+        } catch (e: Exception) {
+            aiDone("AI ka jawab samajh nahi aaya", true)
+        }
+    }
 
     override fun onInterrupt() {}
 
@@ -108,6 +358,8 @@ class AutoTapService : AccessibilityService() {
         panel = null
         hidden = false
         stealth = false
+        currentId = null
+        paused = false
     }
 
     // ---------------------------------------------------------------- line drawing
@@ -340,17 +592,10 @@ class AutoTapService : AccessibilityService() {
 
     fun isPanelShown(): Boolean = panel != null
 
-    // minus: sabse aakhri lagaya hua tap ya swipe hata do (har baar ek)
-    private fun removeLastAction() {
-        if (running || recording) {
-            toast("Pehle stop karo")
-            return
-        }
-        if (actions.isEmpty()) {
-            toast("Hatane ke liye kuch nahi hai")
-            return
-        }
-        val a = actions.removeAt(actions.size - 1)
+    // kisi ek point ko hatao (view bhi, list se bhi) aur number dobara lagao
+    private fun removeActionAt(i: Int) {
+        if (i < 0 || i >= actions.size) return
+        val a = actions.removeAt(i)
         try {
             wm.removeView(a.m1)
         } catch (e: Exception) {
@@ -363,6 +608,20 @@ class AutoTapService : AccessibilityService() {
             }
         }
         lineView?.invalidate()
+        refreshLabels()
+    }
+
+    // minus: sabse aakhri lagaya hua tap ya swipe hata do (har baar ek)
+    private fun removeLastAction() {
+        if (running || recording) {
+            toast("Pehle stop karo")
+            return
+        }
+        if (actions.isEmpty()) {
+            toast("Hatane ke liye kuch nahi hai")
+            return
+        }
+        removeActionAt(actions.size - 1)
         toast("Ek hata diya. Bache: " + actions.size)
     }
 
@@ -529,7 +788,8 @@ class AutoTapService : AccessibilityService() {
         val t = TextView(this)
         t.gravity = Gravity.CENTER
         t.setTextColor(Color.WHITE)
-        t.textSize = 14f
+        t.textSize = 12f
+        t.setPadding(0, 0, 0, 0)
         t.typeface = Typeface.DEFAULT_BOLD
         val bg = GradientDrawable()
         bg.shape = GradientDrawable.OVAL
@@ -541,7 +801,7 @@ class AutoTapService : AccessibilityService() {
         val p = lp(dp(44), dp(44))
         p.x = cx - dp(22)
         p.y = cy - dp(22)
-        makeDraggable(t, t, p, onMove = { lineView?.invalidate() })
+        makeDraggable(t, t, p, onMove = { lineView?.invalidate() }, onTap = { openPointSettings(t) })
         if (recording) {
             p.flags = p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
             t.alpha = 0.5f
@@ -550,37 +810,76 @@ class AutoTapService : AccessibilityService() {
         return Pair(t, p)
     }
 
-    private fun addTap(cx: Int, cy: Int) {
+    private fun addTap(cx: Int, cy: Int, dv: Long = 0L, du: Int = 1, rp: Int = 1) {
         val n = actions.size + 1
         val m = newMarker(n.toString(), 0xAAE53935.toInt(), cx, cy)
-        actions.add(Action(m.first, m.second, null, null))
+        val a = Action(m.first, m.second, null, null)
+        a.dv = dv
+        a.du = du
+        a.rp = rp
+        actions.add(a)
+        refreshLabels()
     }
 
-    private fun addSwipe(x1: Int, y1: Int, x2: Int, y2: Int) {
+    private fun addSwipe(x1: Int, y1: Int, x2: Int, y2: Int, dv: Long = 0L, du: Int = 1, rp: Int = 1) {
         ensureLine()
         val n = actions.size + 1
-        val a = newMarker("S$n", 0xAA2E7D32.toInt(), x1, y1)
-        val b = newMarker("E$n", 0xAA1565C0.toInt(), x2, y2)
-        actions.add(Action(a.first, a.second, b.first, b.second))
+        val s = newMarker("S" + n, 0xAA2E7D32.toInt(), x1, y1)
+        val e = newMarker("E" + n, 0xAA1565C0.toInt(), x2, y2)
+        val a = Action(s.first, s.second, e.first, e.second)
+        a.dv = dv
+        a.du = du
+        a.rp = rp
+        actions.add(a)
         lineView?.invalidate()
+        refreshLabels()
     }
 
-    // ---------------------------------------------------------------- autosave
+    private fun shortUnit(u: Int): String = when (u) {
+        0 -> "ms"
+        1 -> "s"
+        else -> "m"
+    }
 
-    private fun currentPoints(): List<List<Float>> {
+    // gole par number + (agar alag time/baar ho to) chhota likha hota hai
+    private fun refreshLabels() {
+        for (i in actions.indices) {
+            val a = actions[i]
+            val n = i + 1
+            val sb = StringBuilder()
+            if (a.dv > 0L) sb.append(a.dv).append(shortUnit(a.du))
+            if (a.rp > 1) {
+                if (sb.isNotEmpty()) sb.append(" ")
+                sb.append("x").append(a.rp)
+            }
+            val ex = sb.toString()
+            val e2 = a.m2
+            if (e2 == null) {
+                a.m1.text = if (ex.isEmpty()) n.toString() else n.toString() + "\n" + ex
+            } else {
+                a.m1.text = if (ex.isEmpty()) "S" + n else "S" + n + "\n" + ex
+                e2.text = "E" + n
+            }
+        }
+    }
+
+    private fun currentPoints(): List<Pt> {
         val dm = resources.displayMetrics
         val w1 = dm.widthPixels.toFloat()
         val h1 = dm.heightPixels.toFloat()
-        val pts = ArrayList<List<Float>>()
+        val pts = ArrayList<Pt>()
         for (a in actions) {
             val q = a.p2
+            val x1 = (a.p1.x + dp(22)) / w1
+            val y1 = (a.p1.y + dp(22)) / h1
             if (q == null) {
-                pts.add(listOf((a.p1.x + dp(22)) / w1, (a.p1.y + dp(22)) / h1))
+                pts.add(Pt(x1, y1, false, 0f, 0f, a.dv, a.du, a.rp))
             } else {
                 pts.add(
-                    listOf(
-                        (a.p1.x + dp(22)) / w1, (a.p1.y + dp(22)) / h1,
-                        (q.x + dp(22)) / w1, (q.y + dp(22)) / h1
+                    Pt(
+                        x1, y1, true,
+                        (q.x + dp(22)) / w1, (q.y + dp(22)) / h1,
+                        a.dv, a.du, a.rp
                     )
                 )
             }
@@ -588,18 +887,19 @@ class AutoTapService : AccessibilityService() {
         return pts
     }
 
-    private fun addFromPoints(points: List<List<Float>>) {
+    private fun addFromPoints(points: List<Pt>) {
         val dm = resources.displayMetrics
         for (pt in points) {
-            if (pt.size >= 4) {
+            if (pt.swipe) {
                 addSwipe(
-                    (pt[0] * dm.widthPixels).toInt(), (pt[1] * dm.heightPixels).toInt(),
-                    (pt[2] * dm.widthPixels).toInt(), (pt[3] * dm.heightPixels).toInt()
+                    (pt.x1 * dm.widthPixels).toInt(), (pt.y1 * dm.heightPixels).toInt(),
+                    (pt.x2 * dm.widthPixels).toInt(), (pt.y2 * dm.heightPixels).toInt(),
+                    pt.dv, pt.du, pt.rp
                 )
-            } else if (pt.size >= 2) {
+            } else {
                 addTap(
-                    (pt[0] * dm.widthPixels).toInt(),
-                    (pt[1] * dm.heightPixels).toInt()
+                    (pt.x1 * dm.widthPixels).toInt(), (pt.y1 * dm.heightPixels).toInt(),
+                    pt.dv, pt.du, pt.rp
                 )
             }
         }
@@ -810,21 +1110,28 @@ class AutoTapService : AccessibilityService() {
 
     // ---------------------------------------------------------------- run / stop
 
-    private fun intervalMs(): Long {
-        val mul = when (unit) {
-            0 -> 1L
-            1 -> 1000L
-            else -> 60000L
-        }
-        return maxOf(value * mul, 50L)
+    private fun unitMs(u: Int): Long = when (u) {
+        0 -> 1L
+        1 -> 1000L
+        else -> 60000L
     }
 
+    private fun intervalMs(): Long = maxOf(value * unitMs(unit), 50L)
+
+    // is action se pehle kitna ruke: apna time ho to wahi, nahi to default
+    private fun delayOf(a: Action): Long =
+        if (a.dv > 0L) maxOf(a.dv * unitMs(a.du), 50L) else intervalMs()
+
+    // ek ek karke, number ke order me. Har point apne time ke baad, apni baar tak (rp), phir agla.
     private val tapRunnable = object : Runnable {
         override fun run() {
             if (!running || actions.isEmpty()) return
+            if (paused) {
+                handler.postDelayed(this, 300)
+                return
+            }
             if (idx >= actions.size) idx = 0
             val a = actions[idx]
-            var wait = intervalMs()
             val q = a.p2
             if (q == null) {
                 tap(a.p1.x + dp(22), a.p1.y + dp(22))
@@ -833,9 +1140,15 @@ class AutoTapService : AccessibilityService() {
                     a.p1.x + dp(22), a.p1.y + dp(22),
                     q.x + dp(22), q.y + dp(22)
                 )
-                wait = maxOf(wait, SWIPE_MS + 100)
             }
-            idx++
+            rep++
+            if (rep >= a.rp) {
+                rep = 0
+                idx++
+            }
+            if (idx >= actions.size) idx = 0
+            var wait = delayOf(actions[idx])
+            if (q != null) wait = maxOf(wait, SWIPE_MS + 100)
             handler.postDelayed(this, wait)
         }
     }
@@ -867,14 +1180,21 @@ class AutoTapService : AccessibilityService() {
         closeSettings()
         running = true
         idx = 0
+        rep = 0
+        paused = false
+        aiBusy = false
+        aiCalls = 0
+        aiFails = 0
+        basePkg = lastPkg
         setAllTouchable(false)
         play.text = "■"
-        handler.postDelayed(tapRunnable, 300)
+        handler.postDelayed(tapRunnable, maxOf(300L, delayOf(actions[0])))
     }
 
     private fun stopRun() {
         if (!running) return
         running = false
+        paused = false
         handler.removeCallbacks(tapRunnable)
         setAllTouchable(true)
         if (this::play.isInitialized) play.text = "▶"
@@ -928,7 +1248,7 @@ class AutoTapService : AccessibilityService() {
         settingsView = null
     }
 
-    private fun showBox(content: View, topDp: Int) {
+    private fun showBox(content: View, topDp: Int, focusable: Boolean = false) {
         val dm = resources.displayMetrics
         val w = minOf(dp(320), dm.widthPixels - dp(32))
         val scroll = ScrollView(this)
@@ -939,7 +1259,7 @@ class AutoTapService : AccessibilityService() {
             View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
         )
         val h = minOf(content.measuredHeight, (dm.heightPixels * 0.85f).toInt())
-        val p = lp(w, h)
+        val p = lp(w, h, focusable)
         p.x = (dm.widthPixels - w) / 2
         p.y = dp(topDp)
         wm.addView(scroll, p)
@@ -980,8 +1300,204 @@ class AutoTapService : AccessibilityService() {
         unit = s.unit
         Store.saveInterval(this, value, unit)
         removeMarkers()
+        currentId = s.id
         addFromPoints(s.points)
         toast("Load ho gaya: ${s.points.size} action")
+    }
+
+    // ---------------------------------------------------------------- point ki apni setting (gole par tap karke)
+
+    private fun saveCurrent(asNew: Boolean): String {
+        val pts = currentPoints()
+        val cid = currentId
+        if (!asNew && cid != null && Store.exists(this, cid)) {
+            Store.update(this, cid, value, unit, pts)
+            return cid
+        }
+        val id = Store.save(this, value, unit, pts)
+        currentId = id
+        return id
+    }
+
+    private fun readClipboard(): String? {
+        return try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val c = cm.primaryClip
+            if (c != null && c.itemCount > 0) c.getItemAt(0).coerceToText(this).toString() else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun extractId(text: String?): String? {
+        if (text == null) return null
+        return Regex("\\b[A-HJ-NP-Z2-9]{6}\\b").find(text.uppercase())?.value
+    }
+
+    private fun openPointSettings(v: View) {
+        if (running || recording) {
+            toast("Pehle stop karo")
+            return
+        }
+        val i = actions.indexOfFirst { it.m1 === v || it.m2 === v }
+        if (i < 0) return
+        val a = actions[i]
+        closeSettings()
+
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(16), dp(14), dp(16), dp(16))
+        val kind = if (a.m2 == null) "tap" else "swipe"
+        box.addView(title("Point " + (i + 1) + " (" + kind + ")"))
+        box.addView(label("Is point se pehle kitna ruke, phir ye hoga"))
+
+        val shown = TextView(this)
+        shown.textSize = 22f
+        shown.typeface = Typeface.DEFAULT_BOLD
+        shown.setTextColor(0xFF1565C0.toInt())
+        shown.gravity = Gravity.CENTER
+        shown.setPadding(0, dp(4), 0, dp(4))
+        fun refreshShown() {
+            if (a.dv <= 0L) {
+                shown.text = "Default: " + value + " " + unitName(unit)
+            } else {
+                shown.text = a.dv.toString() + " " + unitName(a.du)
+            }
+            refreshLabels()
+        }
+        refreshShown()
+        box.addView(shown)
+
+        fun ensureCustom() {
+            if (a.dv <= 0L) {
+                a.dv = value
+                a.du = unit
+            }
+        }
+
+        val unitViews = ArrayList<TextView>()
+        fun paintUnits() {
+            for (k in unitViews.indices) {
+                unitViews[k].background = rounded(
+                    if (a.dv > 0L && k == a.du) 0xFF1976D2.toInt() else 0xFF9E9E9E.toInt(), 8
+                )
+            }
+        }
+
+        fun bump(d: Long) {
+            ensureCustom()
+            a.dv = maxOf(1L, a.dv + d)
+            paintUnits()
+            refreshShown()
+        }
+
+        val steps = row()
+        steps.addView(smallBtn("-10", 0xFF455A64.toInt()) { bump(-10L) })
+        steps.addView(smallBtn("-1", 0xFF455A64.toInt()) { bump(-1L) })
+        steps.addView(smallBtn("+1", 0xFF455A64.toInt()) { bump(1L) })
+        steps.addView(smallBtn("+10", 0xFF455A64.toInt()) { bump(10L) })
+        steps.addView(smallBtn("+100", 0xFF455A64.toInt()) { bump(100L) })
+        box.addView(steps)
+
+        val unitRow = row()
+        for (k in 0..2) {
+            val u = smallBtn(unitName(k), 0xFF9E9E9E.toInt()) {
+                ensureCustom()
+                a.du = k
+                paintUnits()
+                refreshShown()
+            }
+            unitViews.add(u)
+            unitRow.addView(u)
+        }
+        paintUnits()
+        box.addView(unitRow)
+
+        box.addView(label("Jaldi chunne ke liye"))
+        val presets = listOf(
+            Triple("100 ms", 100L, 0), Triple("500 ms", 500L, 0),
+            Triple("1 sec", 1L, 1), Triple("2 sec", 2L, 1),
+            Triple("5 sec", 5L, 1), Triple("10 sec", 10L, 1),
+            Triple("30 sec", 30L, 1), Triple("1 min", 1L, 2)
+        )
+        for (r in 0..1) {
+            val pr = row()
+            for (k in 0..3) {
+                val t = presets[r * 4 + k]
+                pr.addView(smallBtn(t.first, 0xFF00897B.toInt()) {
+                    a.dv = t.second
+                    a.du = t.third
+                    paintUnits()
+                    refreshShown()
+                })
+            }
+            box.addView(pr)
+        }
+
+        val useDefault = action("Default time use karo", 0xFF607D8B.toInt())
+        useDefault.setOnClickListener {
+            a.dv = 0L
+            paintUnits()
+            refreshShown()
+        }
+        box.addView(useDefault)
+
+        box.addView(label("Is point par kitni baar (ek ke baad ek)"))
+        val rpRow = row()
+        val rpShown = TextView(this)
+        rpShown.textSize = 20f
+        rpShown.typeface = Typeface.DEFAULT_BOLD
+        rpShown.setTextColor(0xFF1565C0.toInt())
+        rpShown.gravity = Gravity.CENTER
+        val rl = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        rpShown.layoutParams = rl
+        fun refreshRp() {
+            rpShown.text = "x " + a.rp
+            refreshLabels()
+        }
+        refreshRp()
+        rpRow.addView(smallBtn("-", 0xFF455A64.toInt()) {
+            a.rp = maxOf(1, a.rp - 1)
+            refreshRp()
+        })
+        rpRow.addView(rpShown)
+        rpRow.addView(smallBtn("+", 0xFF455A64.toInt()) {
+            a.rp = minOf(99, a.rp + 1)
+            refreshRp()
+        })
+        box.addView(rpRow)
+
+        val msg = TextView(this)
+        msg.textSize = 16f
+        msg.typeface = Typeface.DEFAULT_BOLD
+        msg.setTextColor(0xFF2E7D32.toInt())
+        msg.setPadding(0, dp(8), 0, 0)
+        msg.visibility = View.GONE
+        box.addView(msg)
+
+        val save = action("Save karo (ID me)", 0xFF2E7D32.toInt())
+        save.setOnClickListener {
+            val id = saveCurrent(false)
+            msg.text = "Save ho gaya. ID: " + id
+            msg.visibility = View.VISIBLE
+        }
+        box.addView(save)
+
+        val del = action("Ye point hatao", 0xFFC62828.toInt())
+        del.setOnClickListener {
+            closeSettings()
+            removeActionAt(i)
+        }
+        box.addView(del)
+
+        val done = action("Theek hai", 0xFF616161.toInt())
+        done.setOnClickListener {
+            refreshLabels()
+            closeSettings()
+        }
+        box.addView(done)
+
+        showBox(box, 40)
     }
 
     // ---------------------------------------------------------------- ID box (save + ID daalna, ek hi jagah)
@@ -1024,7 +1540,12 @@ class AutoTapService : AccessibilityService() {
         }
 
         // ---- save
-        val save = action("Save karo (naya ID banao)", 0xFF2E7D32.toInt())
+        val cid = currentId
+        val canUpdate = cid != null && Store.exists(this, cid)
+        val save = action(
+            if (canUpdate) "Save karo (ID " + cid + " me update)" else "Save karo (naya ID banao)",
+            0xFF2E7D32.toInt()
+        )
         save.setOnClickListener {
             if (actions.isEmpty()) {
                 handler.post {
@@ -1032,7 +1553,7 @@ class AutoTapService : AccessibilityService() {
                     openIdBox("Pehle koi tap ya swipe lagao, tabhi save hoga.", false)
                 }
             } else {
-                val id = Store.save(this, value, unit, currentPoints())
+                val id = saveCurrent(false)
                 handler.post {
                     closeSettings()
                     openIdBox("Save ho gaya. ID: " + id, true)
@@ -1041,8 +1562,27 @@ class AutoTapService : AccessibilityService() {
         }
         box.addView(save)
 
-        // ---- ID daalo (screen ka apna keypad, keyboard nahi chahiye)
-        box.addView(label("ID daalo (load karne ke liye)"))
+        if (canUpdate) {
+            val saveNew = action("Naya ID banao", 0xFF00897B.toInt())
+            saveNew.setOnClickListener {
+                if (actions.isEmpty()) {
+                    handler.post {
+                        closeSettings()
+                        openIdBox("Pehle koi tap ya swipe lagao, tabhi save hoga.", false)
+                    }
+                } else {
+                    val id = saveCurrent(true)
+                    handler.post {
+                        closeSettings()
+                        openIdBox("Naya ID bana: " + id, true)
+                    }
+                }
+            }
+            box.addView(saveNew)
+        }
+
+        // ---- ID daalo (screen ka apna keypad ya seedha Paste)
+        box.addView(label("ID daalo (keypad se ya Paste se)"))
         val disp = TextView(this)
         disp.textSize = 22f
         disp.typeface = Typeface.DEFAULT_BOLD
@@ -1075,10 +1615,21 @@ class AutoTapService : AccessibilityService() {
         }
 
         val ctl = row()
-        ctl.addView(smallBtn("⌫ mitao", 0xFF455A64.toInt()) {
+        ctl.addView(smallBtn("⌫", 0xFF455A64.toInt()) {
             if (typedId.isNotEmpty()) {
                 typedId.setLength(typedId.length - 1)
                 refreshDisp()
+            }
+        })
+        ctl.addView(smallBtn("Paste", 0xFF00897B.toInt()) {
+            val found = extractId(readClipboard())
+            if (found == null) {
+                toast("Clipboard me ID nahi mili. ID copy karke dobara Paste dabao.")
+            } else {
+                typedId.setLength(0)
+                typedId.append(found)
+                refreshDisp()
+                toast("Paste ho gaya. Ab Load karo dabao.")
             }
         })
         ctl.addView(smallBtn("Load karo", 0xFF1976D2.toInt()) {
@@ -1126,6 +1677,28 @@ class AutoTapService : AccessibilityService() {
                     }
                 }
 
+                val copy = TextView(this)
+                copy.text = "Copy"
+                copy.textSize = 13f
+                copy.setTextColor(Color.WHITE)
+                copy.setPadding(dp(10), dp(10), dp(10), dp(10))
+                copy.background = rounded(0xFF00897B.toInt(), 8)
+                val cl = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+                cl.setMargins(0, 0, dp(6), 0)
+                copy.layoutParams = cl
+                copy.setOnClickListener {
+                    try {
+                        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("AutoTap ID", s.id))
+                        toast("ID copy ho gayi: " + s.id)
+                    } catch (e: Exception) {
+                        toast("Copy nahi ho paya")
+                    }
+                }
+
                 val del = TextView(this)
                 del.text = "Hatao"
                 del.textSize = 13f
@@ -1134,6 +1707,7 @@ class AutoTapService : AccessibilityService() {
                 del.background = rounded(0xFFC62828.toInt(), 8)
                 del.setOnClickListener {
                     Store.delete(this, s.id)
+                    if (currentId == s.id) currentId = null
                     handler.post {
                         closeSettings()
                         openIdBox("ID " + s.id + " hata di.", true)
@@ -1141,6 +1715,7 @@ class AutoTapService : AccessibilityService() {
                 }
 
                 r.addView(info)
+                r.addView(copy)
                 r.addView(del)
                 box.addView(r)
             }
@@ -1150,7 +1725,7 @@ class AutoTapService : AccessibilityService() {
         done.setOnClickListener { closeSettings() }
         box.addView(done)
 
-        showBox(box, 40)
+        showBox(box, 40, true)
     }
 
     private fun toggleSettings() {
@@ -1249,6 +1824,7 @@ class AutoTapService : AccessibilityService() {
         val clear = action("Saare points/lines hatao", 0xFFF57C00.toInt())
         clear.setOnClickListener {
             removeMarkers()
+            currentId = null
             toast("Sab hat gaya")
         }
         box.addView(clear)
