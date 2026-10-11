@@ -11,8 +11,24 @@ android {
         applicationId 'com.autotap.app'
         minSdk 24
         targetSdk 34
-        versionCode 1
+        versionCode Integer.parseInt(System.getenv("GITHUB_RUN_NUMBER") ?: "1")
         versionName '1.0'
+    }
+
+    // Har build usi ek pakki key se sign hota hai, taaki naya version purane ke upar install ho
+    // aur phone me saved IDs bachi rahein.
+    signingConfigs {
+        autotap {
+            storeFile rootProject.file("signing/autotap.keystore")
+            storePassword "autotap123"
+            keyAlias "autotap"
+            keyPassword "autotap123"
+        }
+    }
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.autotap
+        }
     }
 
     compileOptions {
