@@ -16,8 +16,6 @@ data class Setup(
 )
 
 object Store {
-    const val REMOVABLE = 8
-
     private fun prefs(c: Context) =
         c.getSharedPreferences("autotap", Context.MODE_PRIVATE)
 
@@ -81,39 +79,6 @@ object Store {
     fun loadInterval(c: Context): Pair<Long, Int> {
         val p = prefs(c)
         return Pair(p.getLong("iv", 1L), p.getInt("iu", 1))
-    }
-
-    // ---- abhi ka kaam apne aap save (band/chalu karne par wapas aa jata hai)
-    fun saveSession(c: Context, points: List<List<Float>>) {
-        val arr = JSONArray()
-        for (p in points) {
-            val one = JSONArray()
-            for (f in p) one.put(f.toDouble())
-            arr.put(one)
-        }
-        prefs(c).edit().putString("session", arr.toString()).apply()
-    }
-
-    fun loadSession(c: Context): List<List<Float>> {
-        val out = ArrayList<List<Float>>()
-        try {
-            val arr = JSONArray(prefs(c).getString("session", "[]") ?: "[]")
-            for (i in 0 until arr.length()) {
-                val a = arr.getJSONArray(i)
-                val one = ArrayList<Float>()
-                for (j in 0 until a.length()) one.add(a.getDouble(j).toFloat())
-                out.add(one)
-            }
-        } catch (e: Exception) {
-        }
-        return out
-    }
-
-    // floating ke kitne button chhupe hue hain (permanent yaad rehta hai)
-    fun hiddenCount(c: Context): Int = prefs(c).getInt("hidden", 0)
-
-    fun setHiddenCount(c: Context, n: Int) {
-        prefs(c).edit().putInt("hidden", n).apply()
     }
 
     fun delete(c: Context, id: String) {
