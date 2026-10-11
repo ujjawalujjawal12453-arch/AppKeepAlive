@@ -173,7 +173,7 @@ class MainActivity : Activity() {
         lt.setTextColor(0xFF263238.toInt())
         lt.text = "Logo   pakad kar hilao, ek baar tap karo to chhota ho jayega\n" +
             "▶   start / stop (infinite loop)\n" +
-            "●   record: screen par tap ya swipe karo, wahi save ho jayega\n" +
+            "●   record: jahan tap/swipe karoge wahi save hoga aur app me bhi chalega\n" +
             "+   ek tap point lagao\n" +
             "↕   swipe line lagao (S se E tak, kisi bhi disha me)\n" +
             "👁   sab chhupa do, kaam chalta rahe (chhota bindu dabao to wapas)\n" +
