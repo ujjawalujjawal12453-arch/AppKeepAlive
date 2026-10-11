@@ -55,6 +55,7 @@ class AutoTapService : AccessibilityService() {
     private var settingsView: View? = null
     private var lineView: LineView? = null
     private var recordView: View? = null
+    private var recordLp: WindowManager.LayoutParams? = null
 
     private val actions = ArrayList<Action>()
     private val typedId = StringBuilder()
@@ -667,7 +668,7 @@ class AutoTapService : AccessibilityService() {
         frame.setBackgroundColor(0x22FF0000)
 
         val banner = TextView(this)
-        banner.text = "●  RECORDING\nScreen par tap ya swipe karo. Khatam hone par ● dabao."
+        banner.text = "●  RECORDING\nJahan tap ya swipe karoge wahi record hoga, aur app me bhi chalega. Khatam hone par ● dabao."
         banner.setTextColor(Color.WHITE)
         banner.textSize = 14f
         banner.gravity = Gravity.CENTER
@@ -683,20 +684,42 @@ class AutoTapService : AccessibilityService() {
 
         var downX = 0f
         var downY = 0f
+        val trail = ArrayList<Float>() // x, y, x, y ...
         frame.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.rawX
                     downY = e.rawY
+                    trail.clear()
+                    trail.add(downX)
+                    trail.add(downY)
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val n = trail.size
+                    if (n >= 2 && n < 240) {
+                        val d = Math.hypot(
+                            (e.rawX - trail[n - 2]).toDouble(),
+                            (e.rawY - trail[n - 1]).toDouble()
+                        )
+                        if (d > dp(8).toDouble()) {
+                            trail.add(e.rawX)
+                            trail.add(e.rawY)
+                        }
+                    }
                 }
                 MotionEvent.ACTION_UP -> {
                     val upX = e.rawX
                     val upY = e.rawY
+                    val held = e.eventTime - e.downTime
                     val dist = Math.hypot((upX - downX).toDouble(), (upY - downY).toDouble())
                     if (dist < dp(24).toDouble()) {
                         addTap(downX.toInt(), downY.toInt())
+                        passThrough(listOf(downX, downY), held)
                     } else {
                         addSwipe(downX.toInt(), downY.toInt(), upX.toInt(), upY.toInt())
+                        trail.add(upX)
+                        trail.add(upY)
+                        passThrough(ArrayList(trail), held)
                     }
                 }
             }
@@ -708,10 +731,62 @@ class AutoTapService : AccessibilityService() {
         p.y = 0
         wm.addView(frame, p)
         recordView = frame
+        recordLp = p
 
         rec.text = "■"
         tint(rec, 0xFFB71C1C.toInt())
         bringPanelToFront()
+    }
+
+    // record ke time: ungli hatate hi wahi touch asli app par bhi bhej do, taaki app me kaam bhi kare.
+    // Is beech record wali parat thodi der ke liye touch ke liye "khuli" ho jati hai.
+    private fun passThrough(points: List<Float>, heldMs: Long) {
+        val rv = recordView ?: return
+        val lpv = recordLp ?: return
+        if (points.size < 2) return
+
+        val path = Path()
+        path.moveTo(points[0], points[1])
+        var i = 2
+        while (i + 1 < points.size) {
+            path.lineTo(points[i], points[i + 1])
+            i += 2
+        }
+        val d = minOf(maxOf(heldMs, 10L), 3000L)
+
+        lpv.flags = lpv.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        try {
+            wm.updateViewLayout(rv, lpv)
+        } catch (e: Exception) {
+        }
+
+        val restore = Runnable {
+            val cur = recordLp
+            val v = recordView
+            if (cur != null && v != null) {
+                cur.flags = cur.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                try {
+                    wm.updateViewLayout(v, cur)
+                } catch (e: Exception) {
+                }
+            }
+        }
+
+        val cb = object : AccessibilityService.GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                handler.post(restore)
+            }
+
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                handler.post(restore)
+            }
+        }
+        val g = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, d))
+            .build()
+        val ok = dispatchGesture(g, cb, null)
+        if (!ok) restore.run()
+        handler.postDelayed(restore, d + 700)
     }
 
     private fun stopRecord() {
@@ -724,6 +799,7 @@ class AutoTapService : AccessibilityService() {
             }
         }
         recordView = null
+        recordLp = null
         setAllTouchable(true)
         if (this::rec.isInitialized) {
             rec.text = "●"
