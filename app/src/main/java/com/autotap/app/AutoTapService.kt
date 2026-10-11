@@ -57,7 +57,6 @@ class AutoTapService : AccessibilityService() {
     private var recordView: View? = null
 
     private val actions = ArrayList<Action>()
-    private val removable = ArrayList<View>()
     private val typedId = StringBuilder()
 
     private var running = false
@@ -266,15 +265,15 @@ class AutoTapService : AccessibilityService() {
         val swipe = btn("↕", 0xFF6A1B9A.toInt())
         val eye = btn("👁", 0xFF00796B.toInt())
         val save = btn("💾", 0xFF0277BD.toInt())
-        val minus = btn("−", 0xFF455A64.toInt())
+        val minus = btn("−", 0xFFEF6C00.toInt())
         val set = btn("⚙", 0xFFF57C00.toInt())
         val close = btn("✕", 0xFFC62828.toInt())
 
         col.addView(handle)
-        col.addView(minus)
         col.addView(play)
         col.addView(rec)
         col.addView(add)
+        col.addView(minus)
         col.addView(swipe)
         col.addView(eye)
         col.addView(save)
@@ -330,39 +329,40 @@ class AutoTapService : AccessibilityService() {
         }
         save.setOnClickListener { toggleIdBox() }
         set.setOnClickListener { toggleSettings() }
-        minus.setOnClickListener {
-            val n = Store.hiddenCount(this)
-            if (n >= Store.REMOVABLE) {
-                toast("Aur button nahi bache. Sab wapas lane ke liye − ko lamba dabao.")
-            } else {
-                Store.setHiddenCount(this, n + 1)
-                applyHidden()
-            }
-        }
-        minus.setOnLongClickListener {
-            Store.setHiddenCount(this, 0)
-            applyHidden()
-            toast("Saare button wapas aa gaye")
-            true
-        }
+        minus.setOnClickListener { removeLastAction() }
         close.setOnClickListener { showCloseChoice() }
 
         wm.addView(col, p)
         panel = col
         panelLp = p
-        removable.clear()
-        removable.addAll(listOf(close, eye, set, save, swipe, add, rec, play))
-        applyHidden()
     }
 
     fun isPanelShown(): Boolean = panel != null
 
-    // minus se jitne button chhupe hain utne gayab (chhupne ka order: band, 👁, ⚙, 💾, ↕, +, ●, ▶)
-    fun applyHidden() {
-        val n = Store.hiddenCount(this)
-        for (i in removable.indices) {
-            removable[i].visibility = if (i < n) View.GONE else View.VISIBLE
+    // minus: sabse aakhri lagaya hua tap ya swipe hata do (har baar ek)
+    private fun removeLastAction() {
+        if (running || recording) {
+            toast("Pehle stop karo")
+            return
         }
+        if (actions.isEmpty()) {
+            toast("Hatane ke liye kuch nahi hai")
+            return
+        }
+        val a = actions.removeAt(actions.size - 1)
+        try {
+            wm.removeView(a.m1)
+        } catch (e: Exception) {
+        }
+        val m2 = a.m2
+        if (m2 != null) {
+            try {
+                wm.removeView(m2)
+            } catch (e: Exception) {
+            }
+        }
+        lineView?.invalidate()
+        toast("Ek hata diya. Bache: " + actions.size)
     }
 
     private fun bringPanelToFront() {
