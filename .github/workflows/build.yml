@@ -3,6 +3,9 @@ name: Build APK
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -13,6 +16,21 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+
+      - name: Signing key (pehli baar banti hai, phir wahi use hoti hai)
+        run: |
+          if [ ! -f signing/autotap.keystore ]; then
+            mkdir -p signing
+            keytool -genkeypair -keystore signing/autotap.keystore \
+              -storepass autotap123 -keypass autotap123 -alias autotap \
+              -keyalg RSA -keysize 2048 -validity 36500 \
+              -dname "CN=AutoTap, O=AutoTap, C=IN"
+            git config user.name "autotap-bot"
+            git config user.email "autotap-bot@users.noreply.github.com"
+            git add signing/autotap.keystore
+            git commit -m "AutoTap: signing key"
+            git push
+          fi
 
       - uses: gradle/actions/setup-gradle@v4
         with:
